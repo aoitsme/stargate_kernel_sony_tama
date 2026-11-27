@@ -956,18 +956,17 @@ uclamp_tg_restrict(struct task_struct *p, enum uclamp_id clamp_id)
 	struct uclamp_se uc_req = p->uclamp_req[clamp_id];
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	unsigned int tg_min, tg_max, value;
+	struct task_group *tg = task_group(p);
 
 	/*
-	 * Tasks in autogroups or root task group will be
-	 * restricted by system defaults.
+	 * Autogroups are not cgroups. Apply the effective clamps of their
+	 * parent cgroup instead.
 	 */
-	if (task_group_is_autogroup(task_group(p)))
-		return uc_req;
-	if (task_group(p) == &root_task_group)
-		return uc_req;
+	if (task_group_is_autogroup(tg))
+		tg = tg->parent;
 
-	tg_min = task_group(p)->uclamp[UCLAMP_MIN].value;
-	tg_max = task_group(p)->uclamp[UCLAMP_MAX].value;
+	tg_min = tg->uclamp[UCLAMP_MIN].value;
+	tg_max = tg->uclamp[UCLAMP_MAX].value;
 	value = uc_req.value;
 	value = clamp(value, tg_min, tg_max);
 	uclamp_se_set(&uc_req, value, false);
@@ -1227,18 +1226,11 @@ uclamp_update_active_tasks(struct cgroup_subsys_state *css)
 	css_task_iter_end(&it);
 }
 
-static void cpu_util_update_eff(struct cgroup_subsys_state *css);
+static void cpu_util_update_eff(struct cgroup_subsys_state *css, bool force);
 static void uclamp_update_root_tg(void)
 {
-	struct task_group *tg = &root_task_group;
-
-	uclamp_se_set(&tg->uclamp_req[UCLAMP_MIN],
-		      sysctl_sched_uclamp_util_min, false);
-	uclamp_se_set(&tg->uclamp_req[UCLAMP_MAX],
-		      sysctl_sched_uclamp_util_max, false);
-
 	rcu_read_lock();
-	cpu_util_update_eff(&root_task_group.css);
+	cpu_util_update_eff(&root_task_group.css, true);
 	rcu_read_unlock();
 }
 #else
@@ -1470,8 +1462,10 @@ static void __init init_uclamp(void)
 	for_each_clamp_id(clamp_id) {
 		uclamp_default[clamp_id] = uc_max;
 #ifdef CONFIG_UCLAMP_TASK_GROUP
-		root_task_group.uclamp_req[clamp_id] = uc_max;
-		root_task_group.uclamp[clamp_id] = uc_max;
+		uclamp_se_set(&root_task_group.uclamp_req[clamp_id],
+			      uclamp_none(clamp_id), false);
+		root_task_group.uclamp[clamp_id] =
+			root_task_group.uclamp_req[clamp_id];
 #endif
 	}
 }
@@ -9993,7 +9987,7 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	/* Propagate the effective uclamp value for the new group */
 	mutex_lock(&uclamp_mutex);
 	rcu_read_lock();
-	cpu_util_update_eff(css);
+	cpu_util_update_eff(css, false);
 	rcu_read_unlock();
 	mutex_unlock(&uclamp_mutex);
 #endif
@@ -10075,7 +10069,7 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
 }
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
-static void cpu_util_update_eff(struct cgroup_subsys_state *css)
+static void cpu_util_update_eff(struct cgroup_subsys_state *css, bool force)
 {
 	struct cgroup_subsys_state *top_css = css;
 	struct uclamp_se *uc_parent = NULL;
@@ -10099,6 +10093,9 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 			    eff[clamp_id] > uc_parent[clamp_id].value) {
 				eff[clamp_id] = uc_parent[clamp_id].value;
 			}
+			/* Cap group clamps with the system defaults */
+			if (eff[clamp_id] > uclamp_default[clamp_id].value)
+				eff[clamp_id] = uclamp_default[clamp_id].value;
 		}
 		/* Ensure protection is always capped by limit */
 		eff[UCLAMP_MIN] = min(eff[UCLAMP_MIN], eff[UCLAMP_MAX]);
@@ -10113,13 +10110,14 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 			uc_se[clamp_id].bucket_id = uclamp_bucket_id(eff[clamp_id]);
 			clamps |= (0x1 << clamp_id);
 		}
-		if (!clamps) {
+		if (!clamps && !force) {
 			css = css_rightmost_descendant(css);
 			continue;
 		}
 
 		/* Immediately update descendants RUNNABLE tasks */
-		uclamp_update_active_tasks(css);
+		if (clamps)
+			uclamp_update_active_tasks(css);
 	}
 }
 
@@ -10193,7 +10191,7 @@ static ssize_t cpu_uclamp_write(struct kernfs_open_file *of, char *buf,
 	tg->uclamp_pct[clamp_id] = req.percent;
 
 	/* Update effective clamps to track the most restrictive value */
-	cpu_util_update_eff(of_css(of));
+	cpu_util_update_eff(of_css(of), false);
 
 	rcu_read_unlock();
 	mutex_unlock(&uclamp_mutex);
@@ -10602,19 +10600,16 @@ static struct cftype cpu_files[] = {
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	{
 		.name = "uclamp.min",
-		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_uclamp_min_show,
 		.write = cpu_uclamp_min_write,
 	},
 	{
 		.name = "uclamp.max",
-		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_uclamp_max_show,
 		.write = cpu_uclamp_max_write,
 	},
 	{
 		.name = "uclamp.latency_sensitive",
-		.flags = CFTYPE_NOT_ON_ROOT,
 		.read_u64 = cpu_uclamp_ls_read_u64,
 		.write_u64 = cpu_uclamp_ls_write_u64,
 	},
